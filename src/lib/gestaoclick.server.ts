@@ -1,0 +1,491 @@
+// Server-only GestãoClick API helpers. Never import from client code.
+import type { SupabaseClient } from "@supabase/supabase-js";
+import type { Database } from "@/integrations/supabase/types";
+
+type Db = SupabaseClient<Database>;
+
+/** Uses the service-role client when that key exists (Lovable hosting); otherwise the caller's client (self-hosting). */
+async function getDb(client?: Db): Promise<Db> {
+  if (process.env["SUPABASE_SERVICE_ROLE_KEY"]) {
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    return supabaseAdmin as unknown as Db;
+  }
+  if (!client) throw new Error("Sem acesso ao banco para sincronizar com o Gestão Click");
+  return client;
+}
+
+const BASE = "https://api.gestaoclick.com";
+
+function headers() {
+  const a = process.env["GESTAOCLICK_ACCESS_TOKEN"];
+  const s = process.env["GESTAOCLICK_SECRET_ACCESS_TOKEN"];
+  if (!a || !s) throw new Error("Chaves do Gestão Click não configuradas");
+  return { "access-token": a, "secret-access-token": s, "Content-Type": "application/json" };
+}
+
+export type GcProduto = { id: string; nome: string; codigo_interno: string; estoque: number };
+
+export async function gcListProdutos(): Promise<GcProduto[]> {
+  const out: GcProduto[] = [];
+  for (let pagina = 1; pagina <= 50; pagina++) {
+    const r = await fetch(`${BASE}/produtos?limite=100&pagina=${pagina}`, { headers: headers() });
+    const j: any = await r.json();
+    if (j?.code !== 200) throw new Error(j?.data?.mensagem ?? "Erro no Gestão Click");
+    for (const p of j.data ?? [])
+      out.push({ id: String(p.id), nome: p.nome, codigo_interno: p.codigo_interno, estoque: Number(p.estoque) || 0 });
+    if (!j.meta?.proxima_pagina) break;
+  }
+  return out;
+}
+
+async function gcGet(id: string): Promise<any | null> {
+  const r = await fetch(`${BASE}/produtos/${id}`, { headers: headers() });
+  const j: any = await r.json().catch(() => null);
+  if (j?.code === 200 && j.data?.id) return j.data;
+  return null;
+}
+
+export async function gcSetEstoque(id: string, estoque: number) {
+  const atual = await gcGet(id);
+  if (!atual) throw new Error("Produto não encontrado no Gestão Click");
+  const body = {
+    nome: atual.nome,
+    codigo_interno: atual.codigo_interno,
+    valor_custo: atual.valor_custo,
+    valor_venda: atual.valor_venda,
+    valores: atual.valores,
+    estoque,
+  };
+  const r = await fetch(`${BASE}/produtos/${id}`, { method: "PUT", headers: headers(), body: JSON.stringify(body) });
+  const j: any = await r.json().catch(() => null);
+  if (j?.code !== 200) throw new Error(j?.data?.mensagem ?? `Erro ${r.status}`);
+  return atual.nome as string;
+}
+
+/** Max GestãoClick products per call: the hosted worker limits outbound requests per request. */
+export const GC_LOTE = 12;
+
+/** Pushes the site's total stock for every GestãoClick product linked to the given site products. */
+export async function pushEstoqueGestaoClick(produtoIds: string[] | "all", client?: Db) {
+  const supabaseAdmin = await getDb(client);
+  let q = supabaseAdmin.from("produtos").select("id,gestaoclick_id").not("gestaoclick_id", "is", null);
+  if (produtoIds !== "all") {
+    if (!produtoIds.length) return { ok: 0, erros: 0 };
+    // Products created on the site that aren't in GestãoClick yet: create them there and link.
+    const { data: novos } = await supabaseAdmin
+      .from("produtos")
+      .select("id,nome,preco,hash_id,codigo_base,ativo")
+      .in("id", produtoIds)
+      .is("gestaoclick_id", null);
+    for (const p of (novos ?? []).slice(0, 4)) {
+      if (!p.ativo) continue;
+      const { data: vs } = await supabaseAdmin.from("variacoes_produto").select("quantidade_estoque").eq("produto_id", p.id);
+      const estoque = (vs ?? []).reduce((s, v) => s + Math.max(0, v.quantidade_estoque), 0);
+      try {
+        const gid = await gcCriar({ nome: p.nome, codigo: p.hash_id || p.codigo_base, preco: Number(p.preco), estoque });
+        await supabaseAdmin.from("produtos").update({ gestaoclick_id: gid }).eq("id", p.id);
+        await supabaseAdmin.from("gestaoclick_sync_log").insert({ gestaoclick_id: gid, nome: p.nome, estoque, ok: true, mensagem: "Criado no Gestão Click" });
+      } catch (e) {
+        console.error("[gestaoclick] criar", p.id, e);
+        await supabaseAdmin.from("gestaoclick_sync_log").insert({ gestaoclick_id: "-", nome: p.nome, estoque, ok: false, mensagem: `Falha ao criar: ${String((e as Error).message ?? e).slice(0, 250)}` });
+      }
+    }
+    const { data: alvo } = await supabaseAdmin.from("produtos").select("gestaoclick_id").in("id", produtoIds).not("gestaoclick_id", "is", null);
+    const gids = [...new Set((alvo ?? []).map((p) => p.gestaoclick_id!))];
+    if (!gids.length) return { ok: 0, erros: 0 };
+    q = q.in("gestaoclick_id", gids);
+  }
+  const { data: prods } = await q;
+  const porGc = new Map<string, string[]>();
+  for (const p of prods ?? []) porGc.set(p.gestaoclick_id!, [...(porGc.get(p.gestaoclick_id!) ?? []), p.id]);
+  const gcIds = [...porGc.keys()].slice(0, GC_LOTE);
+  const todosIds = gcIds.flatMap((g) => porGc.get(g)!);
+  const { data: vars } = todosIds.length
+    ? await supabaseAdmin.from("variacoes_produto").select("produto_id,quantidade_estoque").in("produto_id", todosIds)
+    : { data: [] as { produto_id: string; quantidade_estoque: number }[] };
+  const porProd = new Map<string, number>();
+  for (const v of vars ?? []) porProd.set(v.produto_id, (porProd.get(v.produto_id) ?? 0) + Math.max(0, v.quantidade_estoque));
+  let ok = 0, erros = 0;
+  const logs: any[] = [];
+  await Promise.all(
+    gcIds.map(async (gid) => {
+      const total = porGc.get(gid)!.reduce((s, id) => s + (porProd.get(id) ?? 0), 0);
+      try {
+        const nome = await gcSetEstoque(gid, total);
+        ok++;
+        logs.push({ gestaoclick_id: gid, nome, estoque: total, ok: true });
+      } catch (e) {
+        erros++;
+        console.error("[gestaoclick]", gid, e);
+        logs.push({ gestaoclick_id: gid, estoque: total, ok: false, mensagem: String((e as Error).message ?? e).slice(0, 300) });
+      }
+    }),
+  );
+  if (logs.length) await supabaseAdmin.from("gestaoclick_sync_log").insert(logs);
+  return { ok, erros, restantes: Math.max(0, porGc.size - gcIds.length) };
+}
+
+/** All linked site product ids, used by the client to sync in batches. */
+export async function listProdutosVinculados(client?: Db) {
+  const supabaseAdmin = await getDb(client);
+  const { data } = await supabaseAdmin.from("produtos").select("id,gestaoclick_id").not("gestaoclick_id", "is", null);
+  const vistos = new Set<string>();
+  return (data ?? []).filter((p) => !vistos.has(p.gestaoclick_id!) && vistos.add(p.gestaoclick_id!)).map((p) => p.id);
+}
+
+async function gcCriar(p: { nome: string; codigo: string; preco: number; estoque: number }) {
+  const body = { nome: p.nome, codigo_interno: p.codigo, valor_venda: p.preco, valor_custo: 0, estoque: p.estoque };
+  const r = await fetch(`${BASE}/produtos`, { method: "POST", headers: headers(), body: JSON.stringify(body) });
+  const j: any = await r.json().catch(() => null);
+  if (j?.code !== 200 || !j.data?.id) throw new Error(j?.data?.mensagem ?? `Erro ${r.status}`);
+  return String(j.data.id);
+}
+
+async function gcDesativar(id: string) {
+  const atual = await gcGet(id);
+  if (!atual) return;
+  const body = { nome: atual.nome, codigo_interno: atual.codigo_interno, valor_custo: atual.valor_custo, valor_venda: atual.valor_venda, valores: atual.valores, ativo: "0" };
+  await fetch(`${BASE}/produtos/${id}`, { method: "PUT", headers: headers(), body: JSON.stringify(body) });
+}
+
+/** Two-way product sync, run on demand. Deletions only deactivate. Limited writes per call. */
+export async function syncMaoDupla(client?: Db) {
+  const supabaseAdmin = await getDb(client);
+  const gcLista = await gcListProdutosCompleto();
+  const gcMap = new Map(gcLista.map((g) => [g.id, g]));
+  const { data: prods } = await supabaseAdmin.from("produtos").select("id,nome,preco,ativo,codigo_base,gestaoclick_id");
+  const vinculados = new Set((prods ?? []).map((p) => p.gestaoclick_id).filter(Boolean) as string[]);
+  const r = { atualizados: 0, desativadosSite: 0, criadosSite: 0, criadosGc: 0, desativadosGc: 0, restantes: false };
+  let escritasGc = 0;
+  for (const p of prods ?? []) {
+    if (p.gestaoclick_id) {
+      const g = gcMap.get(p.gestaoclick_id);
+      if (!g || !g.ativo) {
+        if (p.ativo) { await supabaseAdmin.from("produtos").update({ ativo: false }).eq("id", p.id); r.desativadosSite++; }
+        continue;
+      }
+      if (!p.ativo) {
+        if (escritasGc >= GC_LOTE) { r.restantes = true; continue; }
+        await gcDesativar(p.gestaoclick_id); escritasGc++; r.desativadosGc++;
+        continue;
+      }
+      const upd: { nome?: string; preco?: number } = {};
+      if (g.nome && g.nome !== p.nome) upd.nome = g.nome;
+      if (g.preco > 0 && Number(g.preco) !== Number(p.preco)) upd.preco = g.preco;
+      if (Object.keys(upd).length) { await supabaseAdmin.from("produtos").update(upd).eq("id", p.id); r.atualizados++; }
+    } else if (p.ativo) {
+      if (escritasGc >= GC_LOTE) { r.restantes = true; continue; }
+      const { data: vars } = await supabaseAdmin.from("variacoes_produto").select("quantidade_estoque").eq("produto_id", p.id);
+      const estoque = (vars ?? []).reduce((s, v) => s + Math.max(0, v.quantidade_estoque), 0);
+      try {
+        const gid = await gcCriar({ nome: p.nome, codigo: p.codigo_base, preco: Number(p.preco), estoque });
+        escritasGc++;
+        await supabaseAdmin.from("produtos").update({ gestaoclick_id: gid }).eq("id", p.id);
+        vinculados.add(gid); r.criadosGc++;
+      } catch (e) { console.error("[gestaoclick] criar", p.id, e); escritasGc++; }
+    }
+  }
+  for (const g of gcLista) {
+    if (vinculados.has(g.id) || !g.ativo) continue;
+    const codigo = (g.codigo_interno || g.nome).normalize("NFD").replace(/[\u0300-\u036f]/g, "").toUpperCase().replace(/[^A-Z0-9]/g, "").slice(0, 20) || `GC${g.id}`;
+    const { error } = await supabaseAdmin.from("produtos").insert({ nome: g.nome, preco: g.preco || 0, codigo_base: codigo, ativo: false, gestaoclick_id: g.id } as any);
+    if (!error) r.criadosSite++; else console.error("[gestaoclick] importar", g.id, error.message);
+  }
+  return r;
+}
+
+/** Creates in GestãoClick every active site product that has no link yet. Limited writes per call. */
+export async function criarFaltantesNoGestaoClick(client?: Db) {
+  const supabaseAdmin = await getDb(client);
+  const { data: prods } = await supabaseAdmin
+    .from("produtos")
+    .select("id,nome,preco,hash_id,codigo_base")
+    .is("gestaoclick_id", null)
+    .eq("ativo", true)
+    .order("nome");
+  const r = { criados: 0, erros: 0, restantes: 0, total: (prods ?? []).length };
+  let escritas = 0;
+  for (const p of prods ?? []) {
+    if (escritas >= GC_LOTE) { r.restantes++; continue; }
+    const { data: vars } = await supabaseAdmin.from("variacoes_produto").select("quantidade_estoque").eq("produto_id", p.id);
+    const estoque = (vars ?? []).reduce((s, v) => s + Math.max(0, v.quantidade_estoque), 0);
+    escritas++;
+    try {
+      const gid = await gcCriar({ nome: p.nome, codigo: p.hash_id || p.codigo_base, preco: Number(p.preco), estoque });
+      await supabaseAdmin.from("produtos").update({ gestaoclick_id: gid }).eq("id", p.id);
+      await supabaseAdmin.from("gestaoclick_sync_log").insert({ gestaoclick_id: gid, nome: p.nome, estoque, ok: true, mensagem: "Criado no Gestão Click" });
+      r.criados++;
+    } catch (e) {
+      console.error("[gestaoclick] criar", p.id, e);
+      await supabaseAdmin.from("gestaoclick_sync_log").insert({ gestaoclick_id: "-", nome: p.nome, estoque, ok: false, mensagem: `Falha ao criar: ${String((e as Error).message ?? e).slice(0, 250)}` });
+      r.erros++;
+    }
+  }
+  return r;
+}
+
+type GcCompleto = { id: string; nome: string; codigo_interno: string; preco: number; ativo: boolean };
+async function gcListProdutosCompleto(): Promise<GcCompleto[]> {
+  const out: GcCompleto[] = [];
+  for (let pagina = 1; pagina <= 20; pagina++) {
+    const r = await fetch(`${BASE}/produtos?limite=100&pagina=${pagina}`, { headers: headers() });
+    const j: any = await r.json();
+    if (j?.code !== 200) throw new Error(j?.data?.mensagem ?? "Erro no Gestão Click");
+    for (const p of j.data ?? [])
+      out.push({ id: String(p.id), nome: p.nome, codigo_interno: p.codigo_interno ?? "", preco: precoAtacado(p), ativo: String(p.ativo ?? "1") !== "0" });
+    if (!j.meta?.proxima_pagina) break;
+  }
+  return out;
+}
+
+/** Wholesale (ATACADO) price from GestãoClick, falling back to the default sale price. */
+export function precoAtacado(p: any): number {
+  const v = (p?.valores ?? []).find((x: any) => /atacado/i.test(String(x?.nome_tipo ?? "")));
+  const n = Number(v?.valor_venda);
+  return n > 0 ? n : Number(p?.valor_venda) || 0;
+}
+
+export async function gcExportarProdutos() {
+  const out: any[] = [];
+  for (let pagina = 1; pagina <= 50; pagina++) {
+    const r = await fetch(`${BASE}/produtos?limite=100&pagina=${pagina}`, { headers: headers() });
+    const j: any = await r.json();
+    if (j?.code !== 200) throw new Error(j?.data?.mensagem ?? "Erro no Gestão Click");
+    for (const p of j.data ?? [])
+      out.push({
+        id: String(p.id), nome: p.nome, codigo_interno: p.codigo_interno ?? "", codigo_barra: p.codigo_barra ?? "",
+        preco_atacado: precoAtacado(p), preco_varejo: Number(p.valor_venda) || 0,
+        estoque: Number(p.estoque) || 0, ativo: String(p.ativo ?? "1") !== "0",
+      });
+    if (!j.meta?.proxima_pagina) break;
+  }
+  return out;
+}
+
+export type GcEntrada = { id: string; nome: string; codigo_interno: string; preco: number; ativo: boolean };
+export type Mudanca = {
+  gcId: string; tipo: "atualizar" | "vincular" | "importar"; produtoId: string | null;
+  nomeAtual: string | null; nomeNovo: string; precoAtual: number | null; precoNovo: number; codigo: string;
+};
+const limpa = (s: string) => s.normalize("NFD").replace(/[\u0300-\u036f]/g, "").toUpperCase().replace(/[^A-Z0-9]/g, "");
+
+/** Computes the changes a GestãoClick restore would make, without writing anything. */
+export async function planejarRestauracao(client: Db | undefined, entrada?: GcEntrada[]) {
+  const db = await getDb(client);
+  const gc = entrada ?? (await gcListProdutosCompleto());
+  const { data: prods } = await db.from("produtos").select("id,nome,preco,codigo_base,gestaoclick_id");
+  const porGid = new Map((prods ?? []).filter((p) => p.gestaoclick_id).map((p) => [p.gestaoclick_id!, p]));
+  const porCodigo = new Map((prods ?? []).filter((p) => !p.gestaoclick_id).map((p) => [limpa(p.codigo_base), p]));
+  const out: Mudanca[] = [];
+  for (const g of gc) {
+    if (!g.ativo) continue;
+    let p = porGid.get(g.id);
+    let tipo: Mudanca["tipo"] = "atualizar";
+    if (!p && g.codigo_interno) { p = porCodigo.get(limpa(g.codigo_interno)); if (p) tipo = "vincular"; }
+    const codigo = limpa(g.codigo_interno || g.nome).slice(0, 20) || `GC${g.id}`;
+    if (p) {
+      const nomeMuda = !!g.nome && g.nome !== p.nome;
+      const precoMuda = g.preco > 0 && Number(g.preco) !== Number(p.preco);
+      if (tipo === "atualizar" && !nomeMuda && !precoMuda) continue;
+      out.push({ gcId: g.id, tipo, produtoId: p.id, nomeAtual: p.nome, nomeNovo: g.nome || p.nome, precoAtual: Number(p.preco), precoNovo: g.preco > 0 ? g.preco : Number(p.preco), codigo });
+    } else {
+      out.push({ gcId: g.id, tipo: "importar", produtoId: null, nomeAtual: null, nomeNovo: g.nome, precoAtual: null, precoNovo: g.preco || 0, codigo });
+    }
+  }
+  return out;
+}
+
+/** Applies only the reviewed changes. Never deletes. */
+export async function aplicarRestauracao(client: Db | undefined, mudancas: Mudanca[]) {
+  const db = await getDb(client);
+  const r = { atualizados: 0, vinculados: 0, importados: 0, erros: 0 };
+  for (const m of mudancas) {
+    if (m.produtoId) {
+      const upd: Record<string, unknown> = { nome: m.nomeNovo, preco: m.precoNovo };
+      if (m.tipo === "vincular") upd.gestaoclick_id = m.gcId;
+      const { error } = await db.from("produtos").update(upd as any).eq("id", m.produtoId);
+      if (error) r.erros++; else m.tipo === "vincular" ? r.vinculados++ : r.atualizados++;
+    } else {
+      const { error } = await db.from("produtos").insert({ nome: m.nomeNovo, preco: m.precoNovo, codigo_base: m.codigo, ativo: false, gestaoclick_id: m.gcId } as any);
+      if (error) r.erros++; else r.importados++;
+    }
+  }
+  return r;
+}
+
+// ---- Sales (vendas) ----
+const SIT_CONCRETIZADA = "4796729";
+const SIT_CANCELADA = "4796730";
+
+async function gcJson(r: Response): Promise<any> {
+  const t = await r.text();
+  const i = t.indexOf('{"code"');
+  try { return JSON.parse(i >= 0 ? t.slice(i) : t); } catch { return null; }
+}
+
+async function gcClienteId(nome: string, whatsapp: string | null): Promise<string> {
+  const dig = (whatsapp ?? "").replace(/\D/g, "");
+  const nomeLimpo = (nome || "Cliente do site").slice(0, 100);
+  const r = await fetch(`${BASE}/clientes?nome=${encodeURIComponent(nomeLimpo)}&limite=20`, { headers: headers() });
+  const j = await gcJson(r);
+  const lista: any[] = j?.code === 200 && Array.isArray(j.data) ? j.data : [];
+  const achado = lista.find((c) => dig && String(c.celular ?? c.telefone ?? "").replace(/\D/g, "").endsWith(dig.slice(-8)))
+    ?? lista.find((c) => String(c.nome).trim().toLowerCase() === nomeLimpo.trim().toLowerCase());
+  if (achado) return String(achado.id);
+  const c = await fetch(`${BASE}/clientes`, {
+    method: "POST", headers: headers(),
+    body: JSON.stringify({ tipo_pessoa: "PF", nome: nomeLimpo, celular: whatsapp ?? "" }),
+  });
+  const cj = await gcJson(c);
+  if (cj?.code !== 200 || !cj.data?.id) throw new Error(cj?.data?.mensagem ?? "Falha ao cadastrar cliente no Gestão Click");
+  return String(cj.data.id);
+}
+
+async function itensVendaGc(db: Db, pedidoId: string) {
+  const { data: itens } = await db.from("pedidos_itens").select("produto_id,quantidade,preco_unitario").eq("pedido_id", pedidoId);
+  const ids = [...new Set((itens ?? []).map((i) => i.produto_id).filter(Boolean))] as string[];
+  const { data: prods } = ids.length ? await db.from("produtos").select("id,gestaoclick_id").in("id", ids) : { data: [] as any[] };
+  const gidDe = new Map((prods ?? []).map((p: any) => [p.id, p.gestaoclick_id]));
+  const agg = new Map<string, { qtd: number; valor: number }>();
+  for (const i of itens ?? []) {
+    const gid = i.produto_id ? gidDe.get(i.produto_id) : null;
+    if (!gid) continue;
+    const a = agg.get(gid) ?? { qtd: 0, valor: 0 };
+    a.qtd += i.quantidade; a.valor += i.quantidade * Number(i.preco_unitario);
+    agg.set(gid, a);
+  }
+  return [...agg].map(([gid, a]) => ({
+    produto: { produto_id: gid, quantidade: String(a.qtd), valor_venda: (a.valor / a.qtd).toFixed(2) },
+  }));
+}
+
+/** Registers a site order as a "Concretizada" sale in GestãoClick (which lowers its stock there). */
+export async function registrarVendaGestaoClick(pedidoId: string, client?: Db) {
+  const db = await getDb(client);
+  const { data: p } = await db.from("pedidos").select("id,cliente_nome,cliente_whatsapp,criado_em,gestaoclick_venda_id,desconto_cupom,status").eq("id", pedidoId).maybeSingle();
+  if (!p || p.gestaoclick_venda_id || p.status === "cancelado") return null;
+  const produtos = await itensVendaGc(db, pedidoId);
+  if (!produtos.length) return null;
+  try {
+    const cliente_id = await gcClienteId(p.cliente_nome ?? "", p.cliente_whatsapp);
+    const body = {
+      tipo: "produto", cliente_id, situacao_id: SIT_CONCRETIZADA,
+      data: String(p.criado_em ?? new Date().toISOString()).slice(0, 10),
+      nome_canal_venda: "Site", observacoes: `Pedido do site #${pedidoId.slice(0, 8)}`,
+      desconto_valor: Number(p.desconto_cupom ?? 0).toFixed(2), produtos,
+    };
+    const r = await fetch(`${BASE}/vendas`, { method: "POST", headers: headers(), body: JSON.stringify(body) });
+    const j = await gcJson(r);
+    if (j?.code !== 200 || !j.data?.id) throw new Error(j?.data?.mensagem ?? `Erro ${r.status}`);
+    const vid = String(j.data.id);
+    let saveDb: Db = db;
+    try {
+      const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+      saveDb = supabaseAdmin as unknown as Db;
+    } catch { /* sem chave admin: usa o cliente atual */ }
+    const { error: saveErr } = await saveDb.from("pedidos").update({ gestaoclick_venda_id: vid } as any).eq("id", pedidoId);
+    if (saveErr) console.error("[gestaoclick] falha ao salvar id da venda", pedidoId, saveErr);
+    await db.from("gestaoclick_sync_log").insert({ gestaoclick_id: vid, nome: `Venda ${j.data.codigo ?? ""} (pedido ${pedidoId.slice(0, 8)})`, ok: true, mensagem: "Venda registrada no Gestão Click" });
+    return vid;
+  } catch (e) {
+    console.error("[gestaoclick] venda", pedidoId, e);
+    await db.from("gestaoclick_sync_log").insert({ gestaoclick_id: "-", nome: `Pedido ${pedidoId.slice(0, 8)}`, ok: false, mensagem: `Falha ao registrar venda: ${String((e as Error).message ?? e).slice(0, 250)}` });
+    return null;
+  }
+}
+
+/** Keeps the GestãoClick sale in step with the order status (cancel returns stock there). */
+export async function atualizarVendaGestaoClick(pedidoId: string, status: string, client?: Db) {
+  const db = await getDb(client);
+  const { data: p } = await db.from("pedidos").select("gestaoclick_venda_id,cliente_nome,cliente_whatsapp,criado_em").eq("id", pedidoId).maybeSingle();
+  if (!p) return;
+  if (!p.gestaoclick_venda_id) {
+    // Nunca cria uma venda nova ao mudar o status: evita pedidos duplicados no Gestão Click.
+    await db.from("gestaoclick_sync_log").insert({ gestaoclick_id: "-", nome: `Pedido ${pedidoId.slice(0, 8)}`, ok: false, mensagem: "Status não enviado: pedido sem venda vinculada no Gestão Click" });
+    return;
+  }
+  try {
+    const produtos = await itensVendaGc(db, pedidoId);
+    const cliente_id = await gcClienteId(p.cliente_nome ?? "", p.cliente_whatsapp);
+    const body = {
+      tipo: "produto", cliente_id, data: String(p.criado_em ?? "").slice(0, 10) || new Date().toISOString().slice(0, 10),
+      situacao_id: status === "cancelado" ? SIT_CANCELADA : SIT_CONCRETIZADA, produtos,
+    };
+    const r = await fetch(`${BASE}/vendas/${p.gestaoclick_venda_id}`, { method: "PUT", headers: headers(), body: JSON.stringify(body) });
+    const j = await gcJson(r);
+    if (j?.code !== 200) throw new Error(j?.data?.mensagem ?? `Erro ${r.status}`);
+    await db.from("gestaoclick_sync_log").insert({ gestaoclick_id: p.gestaoclick_venda_id, nome: `Pedido ${pedidoId.slice(0, 8)}`, ok: true, mensagem: status === "cancelado" ? "Venda cancelada no Gestão Click" : "Venda reativada no Gestão Click" });
+  } catch (e) {
+    console.error("[gestaoclick] venda status", pedidoId, e);
+    await db.from("gestaoclick_sync_log").insert({ gestaoclick_id: p.gestaoclick_venda_id, nome: `Pedido ${pedidoId.slice(0, 8)}`, ok: false, mensagem: `Falha ao atualizar venda: ${String((e as Error).message ?? e).slice(0, 250)}` });
+  }
+}
+
+// ---- Seleção para importação (escolha de preço, código e imagem por item) ----
+export type GcImportavel = {
+  id: string; nome: string; codigo_interno: string; estoque: number;
+  atacado: number; varejo: number; fotos: string[]; vinculado: boolean;
+};
+
+function fotosGc(p: any): string[] {
+  const arr = Array.isArray(p?.fotos) ? p.fotos : [];
+  return arr.map((f: any) => (typeof f === "string" ? f : f?.url ?? f?.foto ?? f?.link)).filter((u: any) => typeof u === "string" && /^https?:\/\//.test(u));
+}
+
+export async function gcListImportaveis(client?: Db): Promise<GcImportavel[]> {
+  const db = await getDb(client);
+  const { data: prods } = await db.from("produtos").select("gestaoclick_id").not("gestaoclick_id", "is", null);
+  const ligados = new Set((prods ?? []).map((p) => p.gestaoclick_id));
+  const out: GcImportavel[] = [];
+  for (let pagina = 1; pagina <= 50; pagina++) {
+    const r = await fetch(`${BASE}/produtos?limite=100&pagina=${pagina}`, { headers: headers() });
+    const j: any = await r.json();
+    if (j?.code !== 200) throw new Error(j?.data?.mensagem ?? "Erro no Gestão Click");
+    for (const p of j.data ?? [])
+      out.push({
+        id: String(p.id), nome: p.nome, codigo_interno: p.codigo_interno ?? "", estoque: Number(p.estoque) || 0,
+        atacado: precoAtacado(p), varejo: Number(p.valor_venda) || 0, fotos: fotosGc(p), vinculado: ligados.has(String(p.id)),
+      });
+    if (!j.meta?.proxima_pagina) break;
+  }
+  return out;
+}
+
+export type ItemImportar = {
+  gcId: string; nome: string; preco: number; codigo: string; imagemUrls: string[]; storagePaths: string[];
+  cores: { nome: string; hex: string; estoque: number }[]; estoque: number; ativo: boolean;
+};
+
+export async function importarSelecionados(client: Db | undefined, itens: ItemImportar[]) {
+  const db = await getDb(client);
+  let criados = 0; const erros: string[] = [];
+  for (const it of itens) {
+    try {
+      const { data: prod, error } = await db.from("produtos")
+        .insert({ nome: it.nome, preco: it.preco, codigo_base: it.codigo, ativo: it.ativo, gestaoclick_id: it.gcId } as any)
+        .select("id").single();
+      if (error || !prod) throw new Error(error?.message ?? "falha ao criar");
+      const cores = it.cores.length ? it.cores : [{ nome: "Única", hex: "#888888", estoque: it.estoque }];
+      await db.from("variacoes_produto").insert(cores.map((c) => ({
+        produto_id: prod.id, nome_cor: c.nome, hex_cor: c.hex, tamanho: "U", quantidade_estoque: Math.max(0, c.estoque),
+      })));
+      const paths: string[] = [...it.storagePaths];
+      for (const url of it.imagemUrls) {
+        try {
+          const r = await fetch(url);
+          if (!r.ok) throw new Error(`imagem ${r.status}`);
+          const tipo = r.headers.get("content-type") ?? "image/jpeg";
+          const ext = (tipo.split("/")[1] ?? "jpg").split(";")[0].replace("jpeg", "jpg");
+          const path = `${prod.id}/gc-${crypto.randomUUID()}.${ext}`;
+          const { error: upErr } = await db.storage.from("product-images").upload(path, await r.arrayBuffer(), { contentType: tipo, upsert: true });
+          if (upErr) throw upErr;
+          paths.push(path);
+        } catch (e) { erros.push(`${it.nome}: imagem não enviada (${(e as Error).message})`); }
+      }
+      if (paths.length)
+        await db.from("imagens_produto").insert(paths.map((sp, i) => ({ produto_id: prod.id, storage_path: sp, principal: i === 0, ordem: i })));
+      criados++;
+    } catch (e) { erros.push(`${it.nome}: ${(e as Error).message}`); }
+  }
+  return { criados, erros };
+}
